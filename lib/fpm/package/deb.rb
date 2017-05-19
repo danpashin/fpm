@@ -115,6 +115,9 @@ class FPM::Package::Deb < FPM::Package
 
   option "--group", "GROUP", "The group owner of files in this package", :default => 'root'
 
+  option "--no-changelog", :flag,
+    "Do not add a changelog by default for Debian packages."
+
   option "--changelog", "FILEPATH", "Add FILEPATH as debian changelog" do |file|
     File.expand_path(file)
   end
@@ -546,39 +549,40 @@ class FPM::Package::Deb < FPM::Package
       end
     end
 
-    # There are two changelogs that may appear:
-    #   - debian-specific changelog, which should be archived as changelog.Debian.gz
-    #   - upstream changelog, which should be archived as changelog.gz
-    # see https://www.debian.org/doc/debian-policy/ch-docs.html#s-changelogs
+    if !attributes[:deb_no_changelog?]
+      # There are two changelogs that may appear:
+      #   - debian-specific changelog, which should be archived as changelog.Debian.gz
+      #   - upstream changelog, which should be archived as changelog.gz
+      # see https://www.debian.org/doc/debian-policy/ch-docs.html#s-changelogs
 
-    # Write the changelog.Debian.gz file
-    dest_changelog = File.join(staging_path, "usr/share/doc/#{name}/changelog.Debian.gz")
-    mkdir_p(File.dirname(dest_changelog))
-    File.new(dest_changelog, "wb", 0644).tap do |changelog|
-      Zlib::GzipWriter.new(changelog, Zlib::BEST_COMPRESSION).tap do |changelog_gz|
-        if not attributes[:source_date_epoch].nil?
-          changelog_gz.mtime = attributes[:source_date_epoch].to_i
-        end
-        if attributes[:deb_changelog]
-          logger.info("Writing user-specified changelog", :source => attributes[:deb_changelog])
-          File.new(attributes[:deb_changelog]).tap do |fd|
-            chunk = nil
-            # Ruby 1.8.7 doesn't have IO#copy_stream
-            changelog_gz.write(chunk) while chunk = fd.read(16384)
-          end.close
-        else
-          logger.info("Creating boilerplate changelog file")
-          changelog_gz.write(template("deb/changelog.erb").result(binding))
-        end
-      end.close
-    end # No need to close, GzipWriter#close will close it.
-
-    # Write the changelog.gz file (upstream changelog)
-    dest_upstream_changelog = File.join(staging_path, "usr/share/doc/#{name}/changelog.gz")
-    if attributes[:deb_upstream_changelog]
-      File.new(dest_upstream_changelog, "wb", 0644).tap do |changelog|
+      # Write the changelog.Debian.gz file
+      dest_changelog = File.join(staging_path, "usr/share/doc/#{name}/changelog.Debian.gz")
+      mkdir_p(File.dirname(dest_changelog))
+      File.new(dest_changelog, "wb", 0644).tap do |changelog|
         Zlib::GzipWriter.new(changelog, Zlib::BEST_COMPRESSION).tap do |changelog_gz|
-            if not attributes[:source_date_epoch].nil?
+          if not attributes[:source_date_epoch].nil?
+            changelog_gz.mtime = attributes[:source_date_epoch].to_i
+          end
+          if attributes[:deb_changelog]
+            logger.info("Writing user-specified changelog", :source => attributes[:deb_changelog])
+            File.new(attributes[:deb_changelog]).tap do |fd|
+              chunk = nil
+              # Ruby 1.8.7 doesn't have IO#copy_stream
+              changelog_gz.write(chunk) while chunk = fd.read(16384)
+            end.close
+          else
+            logger.info("Creating boilerplate changelog file")
+            changelog_gz.write(template("deb/changelog.erb").result(binding))
+          end
+        end.close
+      end # No need to close, GzipWriter#close will close it.
+
+      # Write the changelog.gz file (upstream changelog)
+      dest_upstream_changelog = File.join(staging_path, "usr/share/doc/#{name}/changelog.gz")
+      if attributes[:deb_upstream_changelog]
+        File.new(dest_upstream_changelog, "wb", 0644).tap do |changelog|
+          Zlib::GzipWriter.new(changelog, Zlib::BEST_COMPRESSION).tap do |changelog_gz|
+              if not attributes[:source_date_epoch].nil?
               changelog_gz.mtime = attributes[:source_date_epoch].to_i
             end
             logger.info("Writing user-specified upstream changelog", :source => attributes[:deb_upstream_changelog])
@@ -587,13 +591,14 @@ class FPM::Package::Deb < FPM::Package
               # Ruby 1.8.7 doesn't have IO#copy_stream
               changelog_gz.write(chunk) while chunk = fd.read(16384)
             end.close
-        end.close
-      end # No need to close, GzipWriter#close will close it.
-    end
+          end.close
+        end # No need to close, GzipWriter#close will close it.
+      end
 
-    if File.exist?(dest_changelog) and not File.exist?(dest_upstream_changelog)
-      # see https://www.debian.org/doc/debian-policy/ch-docs.html#s-changelogs
-      File.rename(dest_changelog, dest_upstream_changelog)
+      if File.exist?(dest_changelog) and not File.exist?(dest_upstream_changelog)
+        # see https://www.debian.org/doc/debian-policy/ch-docs.html#s-changelogs
+        File.rename(dest_changelog, dest_upstream_changelog)
+      end
     end
 
     attributes.fetch(:deb_init_list, []).each do |init|
