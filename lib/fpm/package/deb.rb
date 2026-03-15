@@ -27,7 +27,7 @@ class FPM::Package::Deb < FPM::Package
   } unless defined?(SCRIPT_MAP)
 
   # The list of supported compression types. Default is gz (gzip)
-  COMPRESSION_TYPES = [ "gz", "bzip2", "xz", "none" ]
+  COMPRESSION_TYPES = [ "gz", "bzip2", "xz", "zst", "none" ]
 
   # https://www.debian.org/doc/debian-policy/ch-relationships.html#syntax-of-relationship-fields
   # Example value with version relationship: libc6 (>= 2.2.1)
@@ -77,6 +77,19 @@ class FPM::Package::Deb < FPM::Package
         "Must be one of #{COMPRESSION_TYPES.join(", ")}"
     end
     value
+  end
+
+  option "--compression-level", "[0-9]", "Select a compression level. 0 is none or minimal. 9 is max compression.",
+    # Specify which compression level to use on the compressor backend, when building a package
+    :default => nil do |value|
+    valint = value.to_i
+    # if self.attributes[:deb_compression].nil?
+    #   raise "Can't specify a compression level with compression disabled"
+    # end
+    unless value =~ /^\d$/ && valint >= 0 && valint <= 9
+      raise "Invalid compression level '#{value}'. Valid values are integers between 0 and 9 inclusive."
+    end
+    valint
   end
 
   option "--dist", "DIST-TAG", "Set the deb distribution.", :default => "unstable"
@@ -213,6 +226,11 @@ class FPM::Package::Deb < FPM::Package
     next File.expand_path(file)
   end
 
+  option "--systemd-path", "FILEPATH", "Relative path to the systemd service directory",
+    :default => "lib/systemd/system" do |file|
+    next file.gsub(/^\/*/, '')
+  end
+
   option "--systemd-enable", :flag , "Enable service on install or upgrade", :default => false
 
   option "--systemd-auto-start", :flag , "Start service after install or upgrade", :default => false
@@ -265,6 +283,9 @@ class FPM::Package::Deb < FPM::Package
     when "noarch"
       # Debian calls noarch "all"
       @architecture = "all"
+    when "ppc64le"
+      # Debian calls ppc64le "ppc64el"
+      @architecture = "ppc64el"
     end
     return @architecture
   end # def architecture
@@ -335,6 +356,9 @@ class FPM::Package::Deb < FPM::Package
       when "xz"
         controltar = "control.tar.xz"
         compression = "-J"
+      when "zst"
+        controltar = "control.tar.zst"
+        compression = "--use-compress-program 'zstd -d'"
       when 'tar'
         controltar = "control.tar"
         compression = ""
@@ -347,7 +371,7 @@ class FPM::Package::Deb < FPM::Package
 
     build_path("control").tap do |path|
       FileUtils.mkdir(path) if !File.directory?(path)
-      # unpack the control.tar.{,gz,bz2,xz} from the deb package into staging_path
+      # unpack the control.tar.{,gz,bz2,xz,zst} from the deb package into staging_path
       # Unpack the control tarball
       safesystem(ar_cmd[0] + " p #{package} #{controltar} | tar #{compression} -xf - -C #{path}")
 
@@ -457,6 +481,9 @@ class FPM::Package::Deb < FPM::Package
       when "xz"
         datatar = "data.tar.xz"
         compression = "-J"
+      when "zst"
+        datatar = "data.tar.zst"
+        compression = "--use-compress-program 'zstd -d'"
       when 'tar'
         datatar = "data.tar"
         compression = ""
@@ -518,6 +545,20 @@ class FPM::Package::Deb < FPM::Package
       raise FPM::InvalidPackageConfiguration, "#{name}: tar is insufficient to support source_date_epoch."
     end
 
+    systemd_file_extensions = [
+        ".service",
+        ".socket",
+        ".device",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".target",
+        ".path",
+        ".timer",
+        ".slice",
+        ".scope",
+    ]
+
     attributes[:deb_systemd] = []
     attributes.fetch(:deb_systemd_list, []).each do |systemd|
       name = File.basename(systemd)
@@ -525,13 +566,19 @@ class FPM::Package::Deb < FPM::Package
 
       name_with_extension = if extname.empty?
                               "#{name}.service"
-                            elsif [".service", ".timer"].include?(extname)
+                            elsif systemd_file_extensions.include?(extname)
                               name
                             else
-                              raise FPM::InvalidPackageConfiguration, "Invalid systemd unit file extension: #{extname}. Expected .service or .timer, or no extension."
+                              # Mutating the array is fine as we raise directly after, and the array will be re-initialised next time
+                              # this method is called. If this branch is changed in the future so as not to diverge, care should be
+                              # taken to ensure that this mutated version of the array is only used for generating the error message.
+                              systemd_file_extensions[-1] = systemd_file_extensions[-1].prepend("or ")
+                              possible_extensions_str = systemd_file_extensions.join(", ")
+                              raise FPM::InvalidPackageConfiguration,
+                                "Invalid systemd unit file extension: #{extname}. Expected one of: #{possible_extensions_str}"
                             end
 
-      dest_systemd = staging_path("lib/systemd/system/#{name_with_extension}")
+      dest_systemd = staging_path(File.join(attributes[:deb_systemd_path], "#{name_with_extension}"))
       mkdir_p(File.dirname(dest_systemd))
       FileUtils.cp(systemd, dest_systemd)
       File.chmod(0644, dest_systemd)
@@ -645,7 +692,8 @@ class FPM::Package::Deb < FPM::Package
       extname = File.extname(systemd)
       name_with_extension = extname.empty? ? "#{name}.service" : name
 
-      dest_systemd = staging_path("lib/systemd/system/#{name_with_extension}")
+      dest_systemd = staging_path(File.join(attributes[:deb_systemd_path], "#{name_with_extension}"))
+
       mkdir_p(File.dirname(dest_systemd))
       FileUtils.cp(systemd, dest_systemd)
       File.chmod(0644, dest_systemd)
@@ -659,18 +707,29 @@ class FPM::Package::Deb < FPM::Package
         datatar = build_path("data.tar.gz")
         controltar = build_path("control.tar.gz")
         compression_flags = ["-z"]
+      # gnu tar obeys GZIP environment variable with options for gzip; -n = forget original filename and date
+        compressor_options = {"GZIP" => "-#{self.attributes[:deb_compression_level] || 9}" +
+            "#{'n' if tar_cmd_supports_sort_names_and_set_mtime? and not attributes[:source_date_epoch].nil?}"}
       when "bzip2"
         datatar = build_path("data.tar.bz2")
         controltar = build_path("control.tar.gz")
         compression_flags = ["-j"]
+        compressor_options = {"BZIP" => "-#{self.attributes[:deb_compression_level] || 9}"}
       when "xz"
         datatar = build_path("data.tar.xz")
         controltar = build_path("control.tar.xz")
         compression_flags = ["-J"]
+        compressor_options = {"XZ_OPT" => "-#{self.attributes[:deb_compression_level] || 3}"}
+      when "zst"
+        datatar = build_path("data.tar.zst")
+        controltar = build_path("control.tar.zst")
+        compression_flags = ["--use-compress-program", "zstd"]
+        compressor_options = {"ZSTD_CLEVEL" => "-#{self.attributes[:deb_compression_level] || 3}"}
       when "none"
         datatar = build_path("data.tar")
         controltar = build_path("control.tar")
         compression_flags = []
+        compressor_options = {}
       else
         raise FPM::InvalidPackageConfiguration,
           "Unknown compression type '#{self.attributes[:deb_compression]}'"
@@ -679,9 +738,8 @@ class FPM::Package::Deb < FPM::Package
     if tar_cmd_supports_sort_names_and_set_mtime? and not attributes[:source_date_epoch].nil?
       # Use gnu tar options to force deterministic file order and timestamp
       args += ["--sort=name", ("--mtime=@%s" % attributes[:source_date_epoch])]
-      # gnu tar obeys GZIP environment variable with options for gzip; -n = forget original filename and date
-      args.unshift({"GZIP" => "-9n"})
     end
+    args.unshift(compressor_options)
     safesystem(*args)
 
     # pack up the .deb, which is just an 'ar' archive with 3 files
@@ -721,15 +779,32 @@ class FPM::Package::Deb < FPM::Package
     self.dependencies = self.dependencies.collect do |dep|
       fix_dependency(dep)
     end.flatten
+
+    # If an invalid depends field was found i.e. /bin.sh then fix_depends will blank it
+    # Make sure we remove this blank here
+    self.dependencies = self.dependencies.reject { |p| p.empty? }
+
     self.provides = self.provides.collect do |provides|
       fix_provides(provides)
     end.flatten
+    # If an invalid provides field was found i.e. mypackage(arch) then fix_provides will blank it
+    # Make sure we remove this blank here
+    self.provides = self.provides.reject { |p| p.empty? }
 
     if origin == FPM::Package::CPAN
+
+      # By default, we'd prefer to name Debian-targeted Perl packages using the
+      # same naming scheme that Debian itself uses, which is usually something
+      # like "lib<module-name-hyphenated>-perl", such as libregexp-common-perl
+      #
+      logger.info("Changing package name to match Debian's typical libmodule-name-perl style")
+      self.name = "lib#{self.name.sub(/^perl-/, "")}-perl"
+
       # The fpm cpan code presents dependencies and provides fields as perl(ModuleName)
       # so we'll need to convert them to something debian supports.
 
-      # Replace perl(ModuleName) > 1.0 with Debian-style perl-ModuleName (> 1.0)
+      # Replace perl(Module::Name) > 1.0 with Debian-style libmodule-name-perl (> 1.0)
+      # per: https://www.debian.org/doc/packaging-manuals/perl-policy/ch-module_packages.html
       perldepfix = lambda do |dep|
         m = dep.match(/perl\((?<name>[A-Za-z0-9_:]+)\)\s*(?<op>.*$)/)
         if m.nil?
@@ -738,9 +813,9 @@ class FPM::Package::Deb < FPM::Package
         else
           # Also replace '::' in the perl module name with '-'
           modulename = m["name"].gsub("::", "-")
-         
+
           # Fix any upper-casing or other naming concerns Debian has about packages
-          name = "#{attributes[:cpan_package_name_prefix]}-#{modulename}"
+          name = "lib#{modulename}-perl"
 
           if m["op"].empty?
             name
@@ -751,7 +826,9 @@ class FPM::Package::Deb < FPM::Package
         end
       end
 
-      rejects = [ "perl(vars)", "perl(warnings)", "perl(strict)", "perl(Config)" ]
+      rejects = attributes[:rejects].map do |skip|
+        "perl(#{skip})"
+      end
       self.dependencies = self.dependencies.reject do |dep|
         # Reject non-module Perl dependencies like 'vars' and 'warnings'
         rejects.include?(dep)
@@ -822,6 +899,18 @@ class FPM::Package::Deb < FPM::Package
         # Convert strings 'foo >= bar' to 'foo (>= bar)'
         dep = "#{name} (#{debianize_op(op)} #{version})"
       end
+    end
+
+    if dep.start_with?("/")
+      logger.warn("Blanking 'dependency' field '#{dep}' because it's invalid")
+      dep = ""
+      return dep
+    end
+
+    if dep.include?("rpmlib")
+      logger.warn("Blanking 'dependency' field '#{dep}' because it's invalid")
+      dep = ""
+      return dep
     end
 
     name_re = /^[^ \(]+/
@@ -917,6 +1006,11 @@ class FPM::Package::Deb < FPM::Package
       provides = provides.gsub("_", "-")
     end
 
+    if provides.include?("(") and !provides.include?("(=")
+      logger.warn("Blanking 'provides' field '#{provides}' because it's invalid")
+      provides = ""
+    end
+
     if m = provides.match(/^([A-Za-z0-9_-]+)\s*=\s*(\d+.*$)/)
       logger.warn("Replacing 'provides' entry #{provides} with syntax 'name (= version)'")
       provides = "#{m[1]} (= #{m[2]})"
@@ -951,12 +1045,21 @@ class FPM::Package::Deb < FPM::Package
       when "gz", "bzip2", nil
         controltar = "control.tar.gz"
         compression_flags = ["-z"]
+        # gnu tar obeys GZIP environment variable with options for gzip; -n = forget original filename and date
+        compressor_options = {"GZIP" => "-#{self.attributes[:deb_compression_level] || 9}" +
+            "#{'n' if tar_cmd_supports_sort_names_and_set_mtime? and not attributes[:source_date_epoch].nil?}"}
       when "xz"
         controltar = "control.tar.xz"
         compression_flags = ["-J"]
+        compressor_options = {"XZ_OPT" => "-#{self.attributes[:deb_compression_level] || 3}"}
+      when "zst"
+        controltar = "control.tar.zst"
+        compression_flags = ["--use-compress-program", "zstd"]
+        compressor_options = {"ZSTD_CLEVEL" => "-#{self.attributes[:deb_compression_level] || 3}"}
       when "none"
         controltar = "control.tar"
         compression_flags = []
+        compressor_options = {}
       else
         raise FPM::InvalidPackageConfiguration,
           "Unknown compression type '#{self.attributes[:deb_compression]}'"
@@ -971,9 +1074,8 @@ class FPM::Package::Deb < FPM::Package
       if tar_cmd_supports_sort_names_and_set_mtime? and not attributes[:source_date_epoch].nil?
         # Force deterministic file order and timestamp
         args += ["--sort=name", ("--mtime=@%s" % attributes[:source_date_epoch])]
-        # gnu tar obeys GZIP environment variable with options for gzip; -n = forget original filename and date
-        args.unshift({"GZIP" => "-9n"})
       end
+      args.unshift(compressor_options)
       safesystem(*args)
     end
 
@@ -1085,6 +1187,7 @@ class FPM::Package::Deb < FPM::Package
             logger.debug("Adding config file #{path} to Staging area #{staging_path}")
             FileUtils.mkdir_p(File.dirname(dcl))
             FileUtils.cp_r path, dcl
+            add_path(path, allconfigs)
           else
             logger.debug("Config file aready exists in staging area.")
           end
@@ -1107,7 +1210,7 @@ class FPM::Package::Deb < FPM::Package
       end
       upstarts.each do |upstart|
         name = File.basename(upstart, ".upstart")
-        upstartscript = "etc/init/#{name}.conf"
+        upstartscript = "/etc/init/#{name}.conf"
         logger.debug("Add conf file declaration for upstart script", :script => upstartscript)
         allconfigs << upstartscript[1..-1]
       end

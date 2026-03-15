@@ -400,7 +400,7 @@ describe FPM::Package::Deb do
       subject.attributes[:deb_user] = "root"
       subject.attributes[:deb_group] = "root"
       subject.category = "comm"
-      subject.dependencies << "lsb-base"
+      subject.dependencies << "debconf"
 
       subject.instance_variable_set(:@staging_path, staging_path)
 
@@ -413,7 +413,7 @@ describe FPM::Package::Deb do
 
     context "when run against lintian" do
       before do
-        skip("Missing lintian program") unless have_lintian 
+        skip("Missing lintian program") unless have_lintian
       end
 
       lintian_errors_to_ignore = [
@@ -535,7 +535,8 @@ describe FPM::Package::Deb do
     {
       "bzip2" => "bz2",
       "xz" => "xz",
-      "gz" => "gz"
+      "gz" => "gz",
+      "zst" => "zst"
     }.each do |flag,suffix|
       context "when --deb-compression is #{flag}" do
         let(:target) { Stud::Temporary.pathname + ".deb" }
