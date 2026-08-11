@@ -36,22 +36,39 @@ describe FPM::Package::CPAN do
 
   it "should return successful HTTP resonse" do
     response = subject.instance_eval {httppost(
-      "https://fastapi.metacpan.org/v1/release/_search",
-      "{\"fields\":[\"download_url\"],\"filter\":{\"term\":{\"name\":\"File-Temp-0.2310\"}}}"
+      "https://fastapi.metacpan.org/v1/release/_search?_source=download_url",
+      "{\"query\":{\"term\":{\"name\":\"File-Temp-0.2310\"}}}"
     )}
     insist { response.class } == Net::HTTPOK
   end
 
   it "should return metadata hash" do
-    metadata = subject.instance_eval { search("File::Temp") }
+    metadata = subject.instance_eval { search_module("File::Temp") }
     insist { metadata.class } == Hash
     insist { metadata["name"] } == "Temp.pm"
     insist { metadata["distribution"] } == "File-Temp"
   end
 
   it "should download precise version" do
-    metadata = subject.instance_eval { search("Set::Tiny") }
+    metadata = subject.instance_eval { search_module("Set::Tiny") }
     insist { File.basename(subject.instance_eval { download(metadata, "0.01") }) } == "Set-Tiny-0.01.tar.gz"
+  end
+
+  it "should find distributions provided modules" do
+    provided_modules = subject.instance_eval { search_provided_modules("Test-DB", "0.10") }
+    insist { provided_modules } == ["perl(Test::DB) = 0.10", "perl(Test::DB::Mssql) = 0.10", "perl(Test::DB::Mysql) = 0.10", "perl(Test::DB::Postgres) = 0.10", "perl(Test::DB::Sqlite) = 0.10"]
+
+    # The Set-Tiny-0.01 release provides a single module, Set::Tiny version 0.01
+    provided_modules = subject.instance_eval { search_provided_modules("Set-Tiny", "0.01") }
+    insist { provided_modules } == ["perl(Set::Tiny) = 0.01"]
+
+    # Class::DI has packages with no version
+    provided_modules = subject.instance_eval { search_provided_modules("Class-DI", "0.03") }
+    insist { provided_modules } == ["perl(Class::DI) = 0.03", "perl(Class::DI::Definition)", "perl(Class::DI::Factory)", "perl(Class::DI::Resource)", "perl(Class::DI::Resource::YAML)"]
+
+    # File::Spec is a module provided by the PathTools distribution
+    provided_modules = subject.instance_eval { search_provided_modules("File-Spec", "3.75") }
+    insist { provided_modules } == []
   end
 
   it "should package Digest::MD5" do
@@ -71,6 +88,18 @@ describe FPM::Package::CPAN do
     insist { subject.description } == "Perl interface to the MD-5 algorithm"
     insist { subject.vendor } == "Gisle Aas <gisle@activestate.com>"
     insist { subject.dependencies.sort } == ["perl >= 5.006", "perl(Digest::base) >= 1.00", "perl(XSLoader)"]
+    insist { subject.provides } == ["perl(Digest::MD5) = 2.58"]
+  end
+
+  it "should package Regexp::Common" do
+    # Set the version explicitly because we default to installing the newest
+    # version, and a new version could be released that breaks the test.
+    subject.instance_variable_set(:@version, "2024080801");
+    subject.attributes[:cpan_test?] = false
+
+    subject.input("Regexp::Common")
+    insist { subject.name } == "perl-Regexp-Common"
+    insist { subject.dependencies.sort } == ["perl >= 5.010", "perl(Config)", "perl(strict)", "perl(vars)", "perl(warnings)"]
   end
 
   it "should unpack tarball containing ./ leading paths" do
@@ -116,5 +145,14 @@ describe FPM::Package::CPAN do
       # IPC::Session fails 'make test'
       subject.input("IPC::Session")
     end
+  end
+
+  it "should default metacpan api url to https://fastapi.metacpan.org" do
+    insist { subject.attributes[:cpan_metacpan_api_url] } == "https://fastapi.metacpan.org"
+  end
+
+  it "should use custom metacpan api url" do
+    subject.attributes[:cpan_metacpan_api_url] = "https://localhost.invalid"
+    insist { subject.instance_eval { search_module("File::Temp") } }.raises Exception
   end
 end # describe FPM::Package::CPAN
